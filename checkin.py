@@ -30,17 +30,15 @@ CHECKIN_URL = "https://glados.cloud/api/user/checkin"
 STATUS_URL = "https://glados.cloud/api/user/status"
 POINTS_URL = "https://glados.cloud/api/user/points"
 EXCHANGE_URL = "https://glados.cloud/api/user/exchange"
-HEADERS_BASE = {
-    "origin": "https://glados.cloud",
-    "referer": "https://glados.cloud/console/checkin",
-    "user-agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-    # 注意：使用 requests 的 json= 参数时会自动设置 Content-Type: application/json，
-    # 此处无需（也不应）手动设置 content-type，否则与 requests 默认行为重复。
-}
+# 2026-10 稳定版桌面 Chrome。写死的 Chrome/120 会被签到接口判成自动请求。
+# 真正要和登录设备一致时，用 USER_AGENT / GLADOS_USER_AGENT 覆盖。
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/156.0.8078.74 Safari/537.36"
+)
+# 注意：使用 requests 的 json= 参数时会自动设置 Content-Type: application/json，
+# 此处无需（也不应）手动设置 content-type，否则与 requests 默认行为重复。
 PAYLOAD = {"token": "glados.cloud"}
 TIMEOUT = (5, 15)  # (连接超时, 读取超时)
 MAX_RETRY = 3
@@ -66,6 +64,8 @@ _SIG_KEY_RE = re.compile(r"^(?P<prefix>[A-Za-z0-9_.-]+):sess\.sig$")
 # 服务端鉴权失败关键词：命中说明 Cookie 已失效/复制不完整，而非格式问题，
 # 需与「格式校验失败」区分，给出「重新获取 Cookie」的可操作提示。
 AUTH_FAIL_KEYWORDS = ("没有权限", "权限不足", "未登录", "登录已失效", "unauthorized", "forbidden", "invalid token")
+# 签到接口单独的设备校验。查询积分仍可能成功，所以不能把它当成 Cookie 格式错误。
+AUTOMATION_FAIL_KEYWORDS = ("automated check-in", "device-mismatch")
 # Cookie 缺失/不合法时统一输出的期望格式说明（便于用户自查与在日志中直接定位）
 COOKIE_FORMAT_HINT = (
     "期望 Cookie 格式（前缀任意，sess 与 sess.sig 必须成对出现）:\n"
@@ -83,6 +83,78 @@ EXCHANGE_PLANS = {
 
 
 # ==================== 工具函数 ====================
+def resolve_user_agent() -> Tuple[str, bool]:
+    """返回 (User-Agent, 是否来自环境变量)。"""
+    raw = (os.getenv("GLADOS_USER_AGENT") or os.getenv("USER_AGENT") or "").strip()
+    if raw:
+        return raw, True
+    return DEFAULT_USER_AGENT, False
+
+
+def describe_user_agent(user_agent: str) -> str:
+    """日志里只保留平台和 Chrome 版本，避免整串 UA 刷屏。"""
+    match = re.search(r"(?:Chrome|Chromium)/([\d.]+)", user_agent)
+    version = match.group(1) if match else "未知"
+    if "Android" in user_agent:
+        platform = "Android"
+    elif "Macintosh" in user_agent:
+        platform = "macOS"
+    elif "Windows" in user_agent:
+        platform = "Windows"
+    elif "Linux" in user_agent or "X11" in user_agent:
+        platform = "Linux"
+    else:
+        platform = "其他"
+    return f"{platform} Chrome/{version}"
+
+
+def browser_client_hints(user_agent: str) -> Dict[str, str]:
+    """补上和 User-Agent 同一浏览器的客户端提示，避免只改 UA、提示头仍是旧浏览器。"""
+    hints = {
+        "accept": "application/json, text/plain, */*",
+        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+    }
+    match = re.search(r"(?:Chrome|Chromium)/(\d+)", user_agent)
+    if not match:
+        return hints
+    major = match.group(1)
+    if "Android" in user_agent:
+        platform = "Android"
+    elif "Macintosh" in user_agent:
+        platform = "macOS"
+    elif "Windows" in user_agent:
+        platform = "Windows"
+    elif "Linux" in user_agent or "X11" in user_agent:
+        platform = "Linux"
+    else:
+        platform = "Unknown"
+    hints.update({
+        "sec-ch-ua": (
+            f'"Chromium";v="{major}", '
+            f'"Google Chrome";v="{major}", '
+            '"Not_A Brand";v="99"'
+        ),
+        "sec-ch-ua-mobile": "?1" if "Mobile" in user_agent else "?0",
+        "sec-ch-ua-platform": f'"{platform}"',
+    })
+    return hints
+
+
+def build_headers(cookie: str) -> Dict[str, str]:
+    user_agent, _ = resolve_user_agent()
+    headers = {
+        "origin": "https://glados.cloud",
+        "referer": "https://glados.cloud/console/checkin",
+        "user-agent": user_agent,
+        "cookie": cookie,
+    }
+    headers.update(browser_client_hints(user_agent))
+    return headers
+
+
 def safe_json(resp: requests.Response) -> Dict[str, Any]:
     """安全解析 JSON 响应（用于推送等非关键路径，失败返回空字典）。"""
     try:
@@ -630,8 +702,7 @@ def checkin_account(
     exchange_plan: 积分兑换计划名（plan100/plan200/plan500），为 None 时不兑换。
     """
     session.cookies.clear()  # 清除上一个账号的残留 Cookie，避免串扰
-    headers = {**HEADERS_BASE}
-    headers["cookie"] = cookie
+    headers = build_headers(cookie)
 
     email = "unknown"
     days = "-"
@@ -658,9 +729,17 @@ def checkin_account(
         else:
             # 区分「服务端鉴权失败」与「其它业务失败」：鉴权失败通常是 Cookie 过期/
             # 复制不完整，需要给出「重新获取 Cookie」的可操作提示，避免与格式问题混淆。
-            if any(kw in (message or "").lower() for kw in AUTH_FAIL_KEYWORDS):
+            lowered = (message or "").lower()
+            if any(kw in lowered for kw in AUTH_FAIL_KEYWORDS):
                 status = f"❌ 鉴权失败({message}) → 请重新获取 Cookie"
                 logger.warning("账号 %d 鉴权失败，Cookie 可能已过期或复制不完整: %s", index, message)
+            elif any(kw in lowered for kw in AUTOMATION_FAIL_KEYWORDS):
+                status = f"❌ 失败({message})"
+                logger.warning(
+                    "账号 %d 被判定为自动签到。请在登录 GLaDOS 的同一浏览器控制台执行 navigator.userAgent，"
+                    "把完整结果写入 GitHub Variables 的 USER_AGENT，重新登录后同时更新 COOKIES",
+                    index,
+                )
             else:
                 status = f"❌ 失败({message})"
 
@@ -769,6 +848,15 @@ def main() -> int:
         return 1  # L4：配置缺失视为失败，避免 CI 误标绿
 
     logger.info("检测到 %d 个账号", len(cookies))
+    user_agent, from_env = resolve_user_agent()
+    if from_env:
+        logger.info("使用环境变量中的浏览器标识: %s", describe_user_agent(user_agent))
+    else:
+        logger.warning(
+            "未配置 USER_AGENT，使用内置标识 %s。"
+            "若仍提示 Automated check-in detected，请写入登录浏览器的完整 User-Agent",
+            describe_user_agent(user_agent),
+        )
 
     ok = fail = repeat = 0
     lines = []

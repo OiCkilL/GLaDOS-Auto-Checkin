@@ -77,6 +77,15 @@ gld:sess=xxxxxx; gld:sess.sig=yyyyyy
 ⚠️ **必须填在 Secrets，不是 Variables。** 填错位置脚本会读不到值，直接报
 `未检测到 COOKIES`。变量名必须是 `COOKIES`，不能有多余空格。
 
+签到还会核对登录时的浏览器。只更新 `COOKIES`、请求却仍用脚本里写死的旧 Chrome，会返回
+`Automated check-in detected`。请再加一个变量：
+
+1. 在**刚刚登录并复制 Cookie 的那个浏览器**里按 F12，打开 Console，执行 `navigator.userAgent`，复制整串结果
+2. **Settings** → **Secrets and variables** → **Actions** → **Variables**
+3. **Name**：`USER_AGENT`，**Value**：粘贴上一步的整串 User-Agent
+
+浏览器升级后，User-Agent 会变，需要重新登录，并同时更新 `COOKIES` 和 `USER_AGENT`。
+
 ---
 
 ### 第四步：（可选）配置推送
@@ -153,6 +162,12 @@ cookie_账号3
 ---
 
 ## ❓ 常见问题
+
+**Q: 签到提示 `Automated check-in detected`？**
+
+A: Cookie 多半是有效的（日志里仍能看到邮箱、积分和剩余天数）。签到接口拒绝的是和登录浏览器不一致的请求。
+把登录浏览器的 `navigator.userAgent` 写入 Variables `USER_AGENT`，重新登录后同时更新 `COOKIES`。
+不要用这台脚本机器或 GitHub Actions 页面上看到的 Linux User-Agent。
 
 **Q: 签到提示「没有权限」/ 鉴权失败？**
 
